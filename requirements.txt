@@ -1,0 +1,10 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pandas>=2.0
+numpy>=1.24
+requests>=2.31
+pydantic>=2.0
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
+# Optional — only needed if running the MT5 fallback locally on Windows:
+# MetaTrader5>=5.0.45
