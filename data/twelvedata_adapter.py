@@ -17,12 +17,23 @@ against a live response before being trusted as TRUE.
 from __future__ import annotations
 
 import os
+import re
 from typing import Optional
 
 import pandas as pd
 import requests
 
 from .base import DataAdapter, DataUnavailableError, FetchResult, NO_TRUE_VOLUME_INSTRUMENTS
+
+_APIKEY_PATTERN = re.compile(r"(apikey=)[^&\s]+")
+
+
+def _redact(text: str) -> str:
+    """Strip the API key out of any error text before it can reach a log,
+    an API response, or a screenshot. Bug fix: an earlier version let the
+    raw key leak into /analysis error responses via requests' exception
+    string, which includes the full request URL."""
+    return _APIKEY_PATTERN.sub(r"\1[REDACTED]", text)
 
 BASE_URL = "https://api.twelvedata.com/time_series"
 
@@ -73,10 +84,10 @@ class TwelveDataAdapter(DataAdapter):
             resp.raise_for_status()
             payload = resp.json()
         except requests.RequestException as exc:
-            raise DataUnavailableError(f"Twelve Data request failed: {exc}") from exc
+            raise DataUnavailableError(f"Twelve Data request failed: {_redact(str(exc))}") from exc
 
         if payload.get("status") == "error" or "values" not in payload:
-            raise DataUnavailableError(f"Twelve Data error response: {payload}")
+            raise DataUnavailableError(f"Twelve Data error response: {_redact(str(payload))}")
 
         values = payload["values"]
         if not values:
