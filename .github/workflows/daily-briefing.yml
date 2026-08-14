@@ -1,0 +1,23 @@
+name: Daily Morning Briefing
+
+# 06:00 UTC = 09:00 EAT (Nairobi) year-round — Kenya has no daylight
+# saving time, so this cron line never needs seasonal adjustment.
+# Runs ~2 hours before the London session opens (08:00 UTC).
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch: {}   # lets you (or Claude, with a token) trigger it manually to test
+
+jobs:
+  trigger-briefing:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /briefing/generate on Render
+        run: |
+          curl -f -sS -X POST "${{ secrets.BACKEND_URL }}/briefing/generate" \
+            -H "X-Briefing-Secret: ${{ secrets.BRIEFING_SECRET }}" \
+            --max-time 180
+        # --max-time 180: Render's free tier is very likely cold at 6am
+        # (nobody's hit it in the preceding 15 min), so this needs real
+        # headroom for a cold start plus three instruments' worth of
+        # Twelve Data calls, not just a fast warm-service response time.

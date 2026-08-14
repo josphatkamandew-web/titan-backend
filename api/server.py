@@ -14,9 +14,11 @@ terminal happens to be reachable (see data/mt5_adapter.py).
 from __future__ import annotations
 
 import os
+import json
+from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -24,6 +26,7 @@ from config import CONFIG
 from data.base import DataUnavailableError
 from data.manager import DataManager
 from db.store import ValidationStore
+from narrative import generate_narrative
 from orchestrator import analyze
 from validation.backtest_runner import run_validation
 
@@ -134,6 +137,64 @@ def get_journal(instrument: Optional[str] = Query(None), limit: int = Query(200,
 @app.get("/calibration/{instrument}")
 def calibration(instrument: str):
     return store.calibration_summary(instrument)
+
+
+# ---------------- Morning briefing ----------------
+# Triggered by a scheduled GitHub Actions workflow at 06:00 UTC
+# (09:00 EAT / Nairobi, no DST) — before the London session opens.
+# Protected by a shared secret so random traffic can't burn through
+# Twelve Data quota by hammering this endpoint.
+
+BRIEFING_SECRET = os.environ.get("BRIEFING_SECRET")
+
+
+@app.post("/briefing/generate")
+def generate_briefing(x_briefing_secret: Optional[str] = Header(None, alias="X-Briefing-Secret")):
+    if not BRIEFING_SECRET:
+        raise HTTPException(500, "BRIEFING_SECRET is not configured on the server.")
+    if x_briefing_secret != BRIEFING_SECRET:
+        raise HTTPException(403, "Invalid or missing X-Briefing-Secret header.")
+
+    try:
+        dm = get_data_manager()
+    except DataUnavailableError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+    briefing_date = datetime.now(timezone.utc).date().isoformat()
+    timeframe = CONFIG["briefing_timeframe"]
+    results = {}
+
+    for instrument in CONFIG["instruments"]:
+        analysis = analyze(instrument, timeframe, dm, store)
+        narrative = generate_narrative(analysis)
+        store.save_briefing(briefing_date, instrument, timeframe, json.dumps(analysis, default=str), narrative)
+        results[instrument] = {
+            "direction": analysis.get("final", {}).get("direction"),
+            "status": analysis.get("final", {}).get("status"),
+            "narrative_preview": narrative[:120] + "…",
+        }
+
+    return {"briefing_date": briefing_date, "timeframe": timeframe, "results": results}
+
+
+@app.get("/briefing/{instrument}")
+def get_briefing(instrument: str, date: Optional[str] = Query(None)):
+    if instrument not in CONFIG["instruments"]:
+        raise HTTPException(400, f"Unsupported instrument. Use one of {CONFIG['instruments']}")
+    row = store.get_briefing(instrument, date)
+    if row is None:
+        return {"status": "NO_BRIEFING_YET", "instrument": instrument}
+    row = dict(row)
+    row["analysis"] = json.loads(row.pop("analysis_json"))
+    return row
+
+
+@app.get("/briefing-history/{instrument}")
+def briefing_history(instrument: str, limit: int = Query(14, le=90)):
+    rows = store.list_recent_briefings(instrument, limit)
+    for r in rows:
+        r["analysis"] = json.loads(r.pop("analysis_json"))
+    return {"instrument": instrument, "briefings": rows}
 
 
 @app.get("/health")

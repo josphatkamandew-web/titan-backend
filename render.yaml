@@ -10,6 +10,8 @@ services:
         sync: false        # set manually in the Render dashboard — never commit real keys
       - key: ALLOWED_ORIGINS
         value: "https://REPLACE-WITH-YOUR-NETLIFY-SITE.netlify.app"
+      - key: BRIEFING_SECRET
+        sync: false        # set manually — must match the BRIEFING_SECRET GitHub Actions repo secret
       - key: DATABASE_URL
         fromDatabase:
           name: titan-vsa-x-db

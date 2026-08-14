@@ -97,6 +97,17 @@ class ValidationStore:
                 resolved_at TEXT
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS daily_briefing (
+                briefing_date TEXT NOT NULL,
+                instrument TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                analysis_json TEXT NOT NULL,
+                narrative TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (briefing_date, instrument)
+            )
+            """,
         ]
         with self.engine.begin() as conn:
             for stmt in statements:
@@ -251,3 +262,46 @@ class ValidationStore:
                 miscalibrated = True
 
         return {"status": "MISCALIBRATED" if miscalibrated else "OK", "buckets": out}
+
+    # ---------------- daily briefing ----------------
+
+    def save_briefing(self, briefing_date: str, instrument: str, timeframe: str,
+                       analysis_json: str, narrative: str) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO daily_briefing
+                        (briefing_date, instrument, timeframe, analysis_json, narrative, created_at)
+                    VALUES (:d, :i, :t, :a, :n, :ts)
+                    ON CONFLICT (briefing_date, instrument) DO UPDATE SET
+                        timeframe=excluded.timeframe,
+                        analysis_json=excluded.analysis_json,
+                        narrative=excluded.narrative,
+                        created_at=excluded.created_at
+                """),
+                {"d": briefing_date, "i": instrument, "t": timeframe, "a": analysis_json,
+                 "n": narrative, "ts": datetime.now(timezone.utc).isoformat()},
+            )
+
+    def get_briefing(self, instrument: str, briefing_date: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Get a specific date's briefing, or the most recent one if no date given."""
+        with self.engine.begin() as conn:
+            if briefing_date:
+                row = conn.execute(
+                    text("SELECT * FROM daily_briefing WHERE instrument=:i AND briefing_date=:d"),
+                    {"i": instrument, "d": briefing_date},
+                ).mappings().fetchone()
+            else:
+                row = conn.execute(
+                    text("SELECT * FROM daily_briefing WHERE instrument=:i ORDER BY briefing_date DESC LIMIT 1"),
+                    {"i": instrument},
+                ).mappings().fetchone()
+        return dict(row) if row else None
+
+    def list_recent_briefings(self, instrument: str, limit: int = 14) -> List[Dict[str, Any]]:
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                text("SELECT * FROM daily_briefing WHERE instrument=:i ORDER BY briefing_date DESC LIMIT :lim"),
+                {"i": instrument, "lim": limit},
+            ).mappings().fetchall()
+        return [dict(r) for r in rows]
