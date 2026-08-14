@@ -73,7 +73,7 @@ def get_all_validation():
 
 class BacktestRequest(BaseModel):
     engine: str
-    timeframe: str = "M15"
+    timeframe: str = "H1"
     bars: int = 5000
     minimum_sample: int = 100
 
@@ -89,6 +89,40 @@ def run_backtest(instrument: str, req: BacktestRequest):
         raise HTTPException(503, str(exc)) from exc
 
     return run_validation(fetched.df, req.engine, instrument, fetched.volume_type, store, req.minimum_sample)
+
+
+MVP_ENGINES = ["STRUCTURE", "LIQUIDITY_SWEEP", "REGIME", "VSA"]
+
+
+class BacktestAllRequest(BaseModel):
+    timeframe: str = "H1"
+    bars: int = 5000
+    minimum_sample: int = 100
+
+
+@app.post("/backtest-all/{instrument}")
+def run_backtest_all(instrument: str, req: BacktestAllRequest):
+    """Fetches the historical data ONCE and backtests all 4 MVP engines
+    against it, instead of the 4x-redundant Twelve Data usage that
+    calling /backtest four times in a row would cost."""
+    if instrument not in CONFIG["instruments"]:
+        raise HTTPException(400, f"Unsupported instrument. Use one of {CONFIG['instruments']}")
+    try:
+        dm = get_data_manager()
+        fetched = dm.fetch(instrument, req.timeframe, bars=req.bars)
+    except DataUnavailableError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+    results = {}
+    for engine in MVP_ENGINES:
+        results[engine] = run_validation(fetched.df, engine, instrument, fetched.volume_type, store, req.minimum_sample)
+
+    return {
+        "instrument": instrument,
+        "timeframe": req.timeframe,
+        "bars_fetched": len(fetched.df),
+        "results": results,
+    }
 
 
 @app.get("/data-health/{instrument}")
