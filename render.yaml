@@ -9,7 +9,11 @@ services:
       - key: TWELVE_DATA_API_KEY
         sync: false        # set manually in the Render dashboard — never commit real keys
       - key: ALLOWED_ORIGINS
-        value: "https://REPLACE-WITH-YOUR-NETLIFY-SITE.netlify.app"
+        sync: false        # set manually on Render — do NOT give this a fixed `value:` here.
+                            # A fixed value gets re-applied on every Blueprint sync (i.e. every
+                            # git push), silently overwriting whatever you set in the dashboard.
+                            # This was the actual cause of "Backend Unreachable" recurring after
+                            # every deploy — not cold starts, not browser settings.
       - key: BRIEFING_SECRET
         sync: false        # set manually — must match the BRIEFING_SECRET GitHub Actions repo secret
       - key: DATABASE_URL
