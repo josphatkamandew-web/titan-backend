@@ -74,7 +74,7 @@ def get_all_validation():
 class BacktestRequest(BaseModel):
     engine: str
     timeframe: str = "H1"
-    bars: int = 5000
+    bars: int = 8760
     minimum_sample: int = 100
 
 
@@ -96,7 +96,7 @@ MVP_ENGINES = ["STRUCTURE", "LIQUIDITY_SWEEP", "REGIME", "VSA"]
 
 class BacktestAllRequest(BaseModel):
     timeframe: str = "H1"
-    bars: int = 5000
+    bars: int = 8760
     minimum_sample: int = 100
 
 

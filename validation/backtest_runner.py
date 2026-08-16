@@ -1,27 +1,40 @@
 """
-Backtest runner — was completely missing before. validation/stats.py
-had solid statistics and a promotion gate but nothing that actually
-generated a List[TradeResult] from history. This module is that
-missing bridge: walk historical bars, run each MVP engine on a
-rolling window, open a hypothetical trade when an engine fires past
-a threshold, walk forward to resolve it against stop/target, and
-hand the results to validate_setup().
+Backtest runner v2 — two principled improvements over the first pass,
+both aimed at testing what these engines are actually for, not just
+generating a number:
 
-Walk-forward: the run is split into an IN_SAMPLE period (first 70%)
-and an OUT_OF_SAMPLE period (last 30%). Only OUT_OF_SAMPLE trades are
-used for the promotion decision — this stops a rule (even a fixed,
-untuned one) from being promoted purely on the same stretch of data
-used to eyeball it. IN_SAMPLE stats are reported alongside for
-reference but never gate promotion on their own.
+1. STRUCTURAL STOPS/TARGETS instead of blind ATR multiples. A stop now
+   sits just beyond the real recent swing low/high; a target aims at
+   the opposing swing extreme (the next real liquidity), falling back
+   to a guaranteed-2R synthetic target only when the structural target
+   is too close to be worth the trade. This is what the original spec
+   asked for (Section 15.1) — the first version simplified it away for
+   MVP speed, at the cost of ignoring the very structure the engines
+   just detected.
 
-This is intentionally still simple: fixed thresholds, one open trade
-per engine at a time (no pyramiding), ATR-based stop/target. Good
-enough to get real numbers behind the MVP engines; refine later.
+2. CONFLUENCE FILTERING. Previously every engine fired in total
+   isolation — a Liquidity Sweep counted as a signal even if H4/H1
+   structure was screaming the opposite direction, a VSA read counted
+   even in a dead-flat range. Now each engine's trigger is checked
+   against the other context engines before a hypothetical trade opens
+   at all. Fewer trades, but each one reflects agreement rather than
+   one engine's opinion in a vacuum — which is the whole premise behind
+   the Fusion Engine treating agreement as a confidence input.
+
+Neither change was chosen to make the win rate look better — both are
+grounded in "how would you actually read this signal," not tuned
+after seeing a result. That distinction matters: tuning parameters
+until backtest numbers improve is curve-fitting, and it would quietly
+recreate the exact "sounds sophisticated, no real edge" problem this
+whole system was built to avoid.
+
+Walk-forward split (70% in-sample / 30% out-of-sample) is unchanged —
+promotion is still decided on the out-of-sample slice only.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -34,10 +47,12 @@ from engines.vsa import vsa_engine
 from validation.stats import TradeResult, validate_setup
 
 MIN_WINDOW = 60
-MAX_HOLD_BARS = 40
-STOP_ATR_MULT = 1.5
-TARGET_ATR_MULT = 3.0
-DIRECTIONAL_TRIGGER_THRESHOLD = 40  # only backtest reasonably confident triggers
+MAX_HOLD_BARS = 60          # ~2.5 days on H1 — matches an hours-to-days hold, not a scalp
+STOP_ATR_MULT = 1.5         # fallback only, when structure doesn't offer a valid stop
+DIRECTIONAL_TRIGGER_THRESHOLD = 40
+STRUCTURE_LOOKBACK = 20     # bars used to find the swing extremes for stop/target
+MIN_STRUCTURAL_RR = 1.2     # below this, the structural target isn't worth it — use fallback
+FALLBACK_RR = 2.0           # guaranteed reward multiple when falling back
 
 
 EngineFn = Callable[[pd.DataFrame], Dict[str, Any]]
@@ -53,8 +68,77 @@ def _vsa_wrapper(window: pd.DataFrame, volume_type: str) -> Dict[str, Any]:
     return vsa_engine(window, volume_type)
 
 
+# ---------------------------------------------------------------- #
+# 1. Structural stop / target
+# ---------------------------------------------------------------- #
+
+def _swing_extremes(df: pd.DataFrame, i: int, lookback: int = STRUCTURE_LOOKBACK) -> Tuple[float, float]:
+    window = df.iloc[max(0, i - lookback): i]
+    return float(window["high"].max()), float(window["low"].min())
+
+
+def compute_stop_target(df: pd.DataFrame, i: int, direction: str, entry: float, atr: float) -> Tuple[float, float]:
+    swing_high, swing_low = _swing_extremes(df, i)
+    buffer = 0.1 * atr
+
+    if direction == "BULLISH":
+        stop = swing_low - buffer
+        risk = entry - stop
+        if risk <= 0:
+            stop = entry - atr * STOP_ATR_MULT
+            risk = entry - stop
+        target = swing_high
+        reward = target - entry
+        if reward <= 0 or reward / risk < MIN_STRUCTURAL_RR:
+            target = entry + risk * FALLBACK_RR
+    else:
+        stop = swing_high + buffer
+        risk = stop - entry
+        if risk <= 0:
+            stop = entry + atr * STOP_ATR_MULT
+            risk = stop - entry
+        target = swing_low
+        reward = entry - target
+        if reward <= 0 or reward / risk < MIN_STRUCTURAL_RR:
+            target = entry - risk * FALLBACK_RR
+
+    return stop, target
+
+
+# ---------------------------------------------------------------- #
+# 2. Confluence filtering
+# ---------------------------------------------------------------- #
+
+def _confluence_ok(engine_name: str, direction: str, context: Dict[str, Dict[str, Any]]) -> bool:
+    structure = context["structure"]
+    regime = context["regime"]
+
+    if engine_name == "LIQUIDITY_SWEEP":
+        # A sweep against the higher-timeframe read is exactly the kind
+        # of "stop run continuing the real trend" case where the sweep
+        # signal is least trustworthy — require structure to at least
+        # not be actively opposing it.
+        s_dir = structure.get("direction", "NEUTRAL")
+        if s_dir != "NEUTRAL" and s_dir != direction:
+            return False
+
+    if engine_name == "VSA":
+        # No Demand / No Supply reads are far weaker evidence inside a
+        # dead-flat range than inside a real trend.
+        if regime.get("regime") == "RANGING" and regime.get("regime_strength", 0) > 60:
+            return False
+
+    if engine_name == "STRUCTURE":
+        # A fresh HH/HL read inside a strongly contracting/balancing
+        # market is more likely noise than a real continuation.
+        if regime.get("regime") == "CONTRACTION_BALANCE" and regime.get("regime_strength", 0) > 70:
+            return False
+
+    return True
+
+
 def _resolve_trade(df: pd.DataFrame, start_idx: int, direction: str, entry: float,
-                    stop: float, target: float) -> TradeResult | None:
+                    stop: float, target: float) -> Optional[TradeResult]:
     risk_distance = abs(entry - stop)
     if risk_distance <= 0:
         return None
@@ -70,9 +154,7 @@ def _resolve_trade(df: pd.DataFrame, start_idx: int, direction: str, entry: floa
             hit_target = bar["low"] <= target
 
         if hit_stop and hit_target:
-            # Ambiguous same-bar resolution — conservative assumption: stop hit first.
-            r = -1.0
-            return TradeResult("BACKTEST", direction, entry, stop, target, "LOSS", r)
+            return TradeResult("BACKTEST", direction, entry, stop, target, "LOSS", -1.0)
         if hit_stop:
             return TradeResult("BACKTEST", direction, entry, stop, target, "LOSS", -1.0)
         if hit_target:
@@ -80,7 +162,6 @@ def _resolve_trade(df: pd.DataFrame, start_idx: int, direction: str, entry: floa
             r = reward_distance / risk_distance
             return TradeResult("BACKTEST", direction, entry, stop, target, "WIN", r)
 
-    # Timed out without hitting either — scratch at the last held price.
     last_close = df.iloc[end_idx]["close"]
     r = ((last_close - entry) if direction == "BULLISH" else (entry - last_close)) / risk_distance
     outcome = "WIN" if r > 0 else "LOSS" if r < 0 else "SCRATCH"
@@ -88,8 +169,6 @@ def _resolve_trade(df: pd.DataFrame, start_idx: int, direction: str, entry: floa
 
 
 def backtest_engine(df: pd.DataFrame, engine_name: str, volume_type: str = "UNAVAILABLE") -> List[TradeResult]:
-    """Run one engine across the full history and return every
-    hypothetical trade it would have triggered."""
     df = add_metrics(df)
     trades: List[TradeResult] = []
 
@@ -97,8 +176,18 @@ def backtest_engine(df: pd.DataFrame, engine_name: str, volume_type: str = "UNAV
     while i < len(df) - 1:
         window = df.iloc[max(0, i - MIN_WINDOW): i + 1]
 
+        # Context engines computed every step, regardless of which
+        # engine is under test — confluence needs to know what the
+        # others say too.
+        context = {
+            "structure": structure_engine(window, "BACKTEST"),
+            "regime": regime_engine(window),
+        }
+
         if engine_name == "VSA":
             result = _vsa_wrapper(window, volume_type)
+        elif engine_name in ("STRUCTURE", "REGIME"):
+            result = context[engine_name.lower()] if engine_name == "STRUCTURE" else context["regime"]
         else:
             fn = ENGINE_REGISTRY.get(engine_name)
             if fn is None:
@@ -108,22 +197,21 @@ def backtest_engine(df: pd.DataFrame, engine_name: str, volume_type: str = "UNAV
         contribution = result.get("directional_contribution", 0)
         if abs(contribution) >= DIRECTIONAL_TRIGGER_THRESHOLD:
             direction = "BULLISH" if contribution > 0 else "BEARISH"
-            entry_bar = df.iloc[i]
-            entry = float(entry_bar["close"])
-            atr = float(entry_bar["atr"]) if pd.notna(entry_bar.get("atr")) else None
-            if atr and atr > 0:
-                if direction == "BULLISH":
-                    stop, target = entry - atr * STOP_ATR_MULT, entry + atr * TARGET_ATR_MULT
-                else:
-                    stop, target = entry + atr * STOP_ATR_MULT, entry - atr * TARGET_ATR_MULT
 
-                trade = _resolve_trade(df, i, direction, entry, stop, target)
-                if trade is not None:
-                    trade.regime = ""  # left for a future pass that tags regime per trade
-                    trade.session = get_session(entry_bar["time"]) if "time" in entry_bar else ""
-                    trades.append(trade)
-                    i += MAX_HOLD_BARS  # don't open overlapping trades on the same engine
-                    continue
+            if _confluence_ok(engine_name, direction, context):
+                entry_bar = df.iloc[i]
+                entry = float(entry_bar["close"])
+                atr = float(entry_bar["atr"]) if pd.notna(entry_bar.get("atr")) else None
+
+                if atr and atr > 0:
+                    stop, target = compute_stop_target(df, i, direction, entry, atr)
+                    trade = _resolve_trade(df, i, direction, entry, stop, target)
+                    if trade is not None:
+                        trade.regime = context["regime"].get("regime", "")
+                        trade.session = get_session(entry_bar["time"]) if "time" in entry_bar else ""
+                        trades.append(trade)
+                        i += MAX_HOLD_BARS
+                        continue
         i += 1
 
     return trades
@@ -131,8 +219,6 @@ def backtest_engine(df: pd.DataFrame, engine_name: str, volume_type: str = "UNAV
 
 def run_validation(df: pd.DataFrame, engine_name: str, instrument: str, volume_type: str,
                     store, minimum_sample: int = 100) -> Dict[str, Any]:
-    """Full pipeline: backtest -> walk-forward split -> statistics ->
-    promotion decision -> persist to ValidationStore."""
     all_trades = backtest_engine(df, engine_name, volume_type)
 
     split_idx = int(len(all_trades) * 0.7)
@@ -141,7 +227,6 @@ def run_validation(df: pd.DataFrame, engine_name: str, instrument: str, volume_t
     in_sample_result = validate_setup(in_sample, minimum_sample)
     out_of_sample_result = validate_setup(out_of_sample, minimum_sample)
 
-    # Promotion is decided on OUT_OF_SAMPLE only.
     decision = out_of_sample_result["promotion"]["decision"]
     stats = out_of_sample_result["statistics"]
 

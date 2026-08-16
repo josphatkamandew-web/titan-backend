@@ -2,16 +2,26 @@
 Twelve Data adapter — PRIMARY live data source.
 
 Cloud-friendly REST API, works from any hosted backend (no local
-terminal required, unlike MT5). This is why it's primary: the
-website needs to run without a Windows machine sitting behind it.
+terminal required, unlike MT5).
 
 Key limitation (see data/base.py NO_TRUE_VOLUME_INSTRUMENTS):
 Twelve Data's time_series endpoint includes real trading volume
 mainly for exchange-listed instruments (stocks, crypto, indices).
 Spot FX pairs (EURUSD, GBPUSD) are OTC — there is no centralized
 tape, so a "volume" figure there is not true traded size. XAUUSD's
-volume support depends on plan/classification and must be checked
-against a live response before being trusted as TRUE.
+volume support depends on plan/classification — check has_volume
+in a live response rather than assuming either way; if it's still
+UNAVAILABLE after upgrading your plan, that plan tier doesn't
+include it for this instrument and VSA will stay non-functional
+for gold until it does.
+
+PAGINATION: a single time_series call is capped at 5000 bars by the
+provider. Requesting more than that here walks backwards in 5000-bar
+chunks using the `end_date` param and stitches them together — this
+is what makes "1-2 years of H1 history" possible instead of being
+stuck at ~7 months. Each chunk is a separate request, so asking for
+a lot of history costs more API credits — be mindful of your plan's
+rate limits if bumping this up a lot.
 """
 
 from __future__ import annotations
@@ -25,16 +35,6 @@ import requests
 
 from .base import DataAdapter, DataUnavailableError, FetchResult, NO_TRUE_VOLUME_INSTRUMENTS
 
-_APIKEY_PATTERN = re.compile(r"(apikey=)[^&\s]+")
-
-
-def _redact(text: str) -> str:
-    """Strip the API key out of any error text before it can reach a log,
-    an API response, or a screenshot. Bug fix: an earlier version let the
-    raw key leak into /analysis error responses via requests' exception
-    string, which includes the full request URL."""
-    return _APIKEY_PATTERN.sub(r"\1[REDACTED]", text)
-
 BASE_URL = "https://api.twelvedata.com/time_series"
 
 INTERVAL_MAP = {
@@ -44,18 +44,28 @@ INTERVAL_MAP = {
     "M5": "5min",
 }
 
+INTERVAL_TIMEDELTA = {
+    "H4": pd.Timedelta(hours=4),
+    "H1": pd.Timedelta(hours=1),
+    "M15": pd.Timedelta(minutes=15),
+    "M5": pd.Timedelta(minutes=5),
+}
+
 SYMBOL_MAP = {
     "XAUUSD": "XAU/USD",
     "EURUSD": "EUR/USD",
     "GBPUSD": "GBP/USD",
 }
 
+MAX_CHUNK_SIZE = 5000
+MAX_CHUNKS = 6  # hard cap so a large `bars` request can't runaway into excessive API credit use
+
 
 class TwelveDataAdapter(DataAdapter):
     name = "TWELVE_DATA"
 
     def __init__(self, api_key: Optional[str] = None, session: Optional[requests.Session] = None,
-                 timeout: float = 10.0):
+                 timeout: float = 15.0):
         self.api_key = api_key or os.environ.get("TWELVE_DATA_API_KEY")
         if not self.api_key:
             raise DataUnavailableError(
@@ -65,19 +75,18 @@ class TwelveDataAdapter(DataAdapter):
         self.session = session or requests.Session()
         self.timeout = timeout
 
-    def fetch_ohlcv(self, symbol: str, timeframe: str, bars: int = 1500) -> FetchResult:
-        if timeframe not in INTERVAL_MAP:
-            raise ValueError(f"Unsupported timeframe: {timeframe}")
-
-        td_symbol = SYMBOL_MAP.get(symbol, symbol)
+    def _fetch_chunk(self, td_symbol: str, interval: str, outputsize: int,
+                      end_date: Optional[str] = None) -> tuple[pd.DataFrame, bool]:
         params = {
             "symbol": td_symbol,
-            "interval": INTERVAL_MAP[timeframe],
-            "outputsize": min(bars, 5000),
+            "interval": interval,
+            "outputsize": min(outputsize, MAX_CHUNK_SIZE),
             "apikey": self.api_key,
             "order": "ASC",
             "timezone": "UTC",
         }
+        if end_date:
+            params["end_date"] = end_date
 
         try:
             resp = self.session.get(BASE_URL, params=params, timeout=self.timeout)
@@ -91,7 +100,7 @@ class TwelveDataAdapter(DataAdapter):
 
         values = payload["values"]
         if not values:
-            raise DataUnavailableError(f"Twelve Data returned no bars for {symbol} {timeframe}")
+            return pd.DataFrame(), False
 
         df = pd.DataFrame(values)
         df = df.rename(columns={"datetime": "time"})
@@ -105,16 +114,55 @@ class TwelveDataAdapter(DataAdapter):
         else:
             df["volume"] = pd.NA
 
-        df = df.sort_values("time").reset_index(drop=True)
+        return df.sort_values("time").reset_index(drop=True), has_volume
+
+    def fetch_ohlcv(self, symbol: str, timeframe: str, bars: int = 1500) -> FetchResult:
+        if timeframe not in INTERVAL_MAP:
+            raise ValueError(f"Unsupported timeframe: {timeframe}")
+
+        td_symbol = SYMBOL_MAP.get(symbol, symbol)
+        interval = INTERVAL_MAP[timeframe]
+
+        frames = []
+        remaining = bars
+        end_date: Optional[str] = None
+        has_volume_any = False
+        chunks = 0
+
+        while remaining > 0 and chunks < MAX_CHUNKS:
+            requested = min(remaining, MAX_CHUNK_SIZE)
+            chunk_df, has_volume = self._fetch_chunk(td_symbol, interval, requested, end_date)
+            if chunk_df.empty:
+                break
+            frames.append(chunk_df)
+            has_volume_any = has_volume_any or has_volume
+            remaining -= len(chunk_df)
+            chunks += 1
+
+            if len(chunk_df) < requested:
+                # Provider returned fewer bars than asked for — it's run out of history.
+                break
+
+            earliest = chunk_df["time"].min()
+            end_date = (earliest - INTERVAL_TIMEDELTA[timeframe]).strftime("%Y-%m-%d %H:%M:%S")
+
+        if not frames:
+            raise DataUnavailableError(f"Twelve Data returned no bars for {symbol} {timeframe}")
+
+        df = pd.concat(frames, ignore_index=True)
+        df = df.drop_duplicates(subset="time").sort_values("time").reset_index(drop=True)
 
         if symbol in NO_TRUE_VOLUME_INSTRUMENTS:
-            # Never let an FX pair claim TRUE volume even if the field is populated —
-            # it is tick/quote-derived, not centralized traded size.
-            volume_type = "TICK_ESTIMATE" if has_volume else "UNAVAILABLE"
+            volume_type = "TICK_ESTIMATE" if has_volume_any else "UNAVAILABLE"
         else:
-            # e.g. XAUUSD — confirm against a live response; do not assume.
-            volume_type = "TRUE" if has_volume else "UNAVAILABLE"
+            volume_type = "TRUE" if has_volume_any else "UNAVAILABLE"
 
         data_quality = "HIGH" if volume_type != "UNAVAILABLE" else "MEDIUM"
 
         return FetchResult(df=df, source=self.name, volume_type=volume_type, data_quality=data_quality)
+
+
+def _redact(text: str) -> str:
+    """Strip the API key out of any error text before it can reach a log,
+    an API response, or a screenshot."""
+    return re.sub(r"(apikey=)[^&\s]+", r"\1[REDACTED]", text)
